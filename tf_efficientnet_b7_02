@@ -1,0 +1,163 @@
+import os
+import torch
+from torch.utils.data import DataLoader, Dataset
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from PIL import Image
+import numpy as np
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import timm
+import glob
+import torch.nn as nn
+
+# 定义数据增强策略
+test_aug = A.Compose([
+    A.Normalize(mean=[0.17361031,0.17362685,0.17362084], std=[0.06815493,0.06816461,0.06816177], p=1.0),
+    ToTensorV2(),
+])
+
+# 自定义数据集
+class lwhdataset(Dataset):
+    def __init__(self, data_dir, transform, size, pad):
+        self.data_dir = data_dir
+        self.pad = pad
+        self.size = size
+        self.label_dict = {"0": 0, "1": 1, "2": 2, "3": 3}
+        self.c_paths = sorted(data_dir)
+        self.transforms = transform
+
+    def __getitem__(self, index):
+        label = self.label_dict[self.c_paths[index].split('\\')[-2]]
+        image = Image.open(self.c_paths[index]).convert("RGB")
+        if self.pad:
+            image = self.pading(self.size, image)
+            image = np.array(image)
+        else:
+            image = np.array(image)
+        image = self.transforms(image=image)['image']
+        return image, label, self.c_paths[index]  # Return image path
+
+    def __len__(self):
+        if len(self.c_paths) == 0:
+            raise Exception("\ndata_dir:{} is an empty dir! Please check your path to images!".format(self.data_dir))
+        return len(self.c_paths)
+
+    @staticmethod
+    def pading(size, img):
+        padding_v = tuple([125, 125, 125])
+        w, h = img.size
+        target_size = size
+        interpolation = Image.BILINEAR
+        if w > h:
+            img = img.resize((int(target_size), int(h * target_size * 1.0 / w)), interpolation)
+        else:
+            img = img.resize((int(w * target_size * 1.0 / h), int(target_size)), interpolation)
+        ret_img = Image.new("RGB", (target_size, target_size), padding_v)
+        w, h = img.size
+        st_w = int((ret_img.size[0] - w) / 2.0)
+        st_h = int((ret_img.size[1] - h) / 2.0)
+        ret_img.paste(img, (st_w, st_h))
+        return ret_img
+
+# 定义模型
+class Net5(nn.Module):
+    def __init__(self, backbone_name, n_classes):
+        super(Net5, self).__init__()
+        self.n_classes = n_classes
+        self.backbone_name = backbone_name
+        self.backbone = timm.create_model(self.backbone_name, pretrained=True, in_chans=3, global_pool="avg",
+                                          num_classes=2560)
+        self.dropout_1 = nn.Dropout(0.1)
+        self.dropout_2 = nn.Dropout(0.2)
+        self.dropout_3 = nn.Dropout(0.3)
+        self.dropout_4 = nn.Dropout(0.4)
+        self.dropout_5 = nn.Dropout(0.5)
+        self.head = nn.Linear(2560, self.n_classes)
+
+    def forward(self, x):
+        x = self.backbone(x)
+        x = (self.dropout_1(x) +
+             self.dropout_2(x) +
+             self.dropout_3(x) +
+             self.dropout_4(x) +
+             self.dropout_5(x)
+             ) / 5
+        y = self.head(x)
+        return y
+
+# 测试代码
+if __name__ == '__main__':
+    class CFG:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        ckpt_fold = r"C:\CNN\model_efficientnet_b7_3"
+        ckpt_name = "tf_efficientnet_b7"
+        test_dir = r"C:\CNN\data_11\test"
+        img_size = [224, 224]
+        test_bs = 4
+        backbone = 'tf_efficientnet_b7'
+        num_classes = 4
+
+    # 加载模型
+    model = Net5(backbone_name=CFG.backbone, n_classes=CFG.num_classes)
+    model_path = os.path.join(CFG.ckpt_fold, "best_model.pth")
+
+    # 加载预训练的权重
+    pretrained_dict = torch.load(model_path, map_location=CFG.device)
+
+    # 获取当前模型的 state_dict
+    model_dict = model.state_dict()
+
+    # 过滤掉不匹配的键
+    pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and v.size() == model_dict[k].size()}
+
+    # 更新现有的模型字典
+    model_dict.update(pretrained_dict)
+
+    # 加载我们更新后的 state_dict
+    model.load_state_dict(model_dict, strict=False)
+
+    # 将模型移动到设备上
+    model.to(CFG.device)
+    model.eval()
+
+    # 加载测试数据
+    test_path = sorted(glob.glob(CFG.test_dir + "/*/*"))
+    test_data = lwhdataset(data_dir=test_path, transform=test_aug, size=CFG.img_size[0], pad=True)
+    test_loader = DataLoader(dataset=test_data, batch_size=CFG.test_bs, shuffle=False, num_workers=8)
+
+    # 进行测试
+    all_labels = []
+    all_preds = []
+
+    with torch.no_grad():
+        for images, labels, paths in test_loader:  # 添加路径
+            images = images.to(CFG.device, dtype=torch.float)
+            labels = labels.to(CFG.device)
+
+            outputs = model(images)
+            _, predicted = torch.max(outputs.data, 1)
+
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(predicted.cpu().numpy())
+
+            # 打印每个图片的真实类别和预测类别
+            for true_label, pred_label, img_path in zip(labels.cpu().numpy(), predicted.cpu().numpy(), paths):
+                print(f"Image Path: {img_path}, True Label: {true_label}, Predicted Label: {pred_label}")
+
+    # 输出结果
+    print("\nClassification Report:")
+    report = classification_report(all_labels, all_preds, target_names=['class_0', 'class_1', 'class_2', 'class_3'], output_dict=True)
+    print(report)
+
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(all_labels, all_preds))
+
+    # 打印每个类别的准确率
+    print("\nPer Class Accuracy:")
+    for class_name, metrics in report.items():
+        if class_name.startswith('class_'):
+            print(f"{class_name}: {metrics['precision']:.2f}")
+
+    # 打印总体准确率
+    overall_accuracy = accuracy_score(all_labels, all_preds)
+    print(f"\nOverall Accuracy: {overall_accuracy:.2f}")
