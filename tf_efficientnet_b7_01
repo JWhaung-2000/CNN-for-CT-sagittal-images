@@ -1,0 +1,333 @@
+import math
+import os
+import pdb
+import cv2
+import time
+import glob
+import random
+from PIL import Image
+from albumentations.pytorch import ToTensorV2
+from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.autograd import Variable
+import gc
+import numpy as np
+import torch.nn.functional as F
+import torch  # PyTorch
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda import amp  # https://pytorch.org/docs/stable/notes/amp_examples.html
+from torch import nn
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+from sklearn.model_selection import StratifiedGroupKFold, KFold  # Sklearn
+import albumentations as A  # Augmentations
+import timm
+from timm.data.mixup import Mixup
+from adamp import AdamP
+import logging
+from transformers import AutoModel
+from torch_optimizer import RAdam, Lookahead  # 新增
+
+# 数据增强策略
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def get_logger(filename, verbosity=1, name=None):
+    level_dict = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING}
+    formatter = logging.Formatter(
+        "[%(asctime)s][%(filename)s][%(levelname)s] %(message)s"
+    )
+    logger = logging.getLogger(name)
+    logger.setLevel(level_dict[verbosity])
+
+    fh = logging.FileHandler(filename, "w")
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+    return logger
+
+
+train_aug = A.Compose([
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+    A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
+    A.OneOf([
+        A.GridDistortion(num_steps=5, distort_limit=0.1, p=0.3),
+        A.OpticalDistortion(distort_limit=0.3, shift_limit=0.3, p=0.3),
+        A.ElasticTransform(alpha=1, sigma=50, p=0.3)  # 去掉了alpha_affine参数
+    ], p=0.3),
+    A.Normalize(mean=[0.17361031, 0.17362685, 0.17362084], std=[0.06815493, 0.06816461, 0.06816177], p=1.0),
+    ToTensorV2(),
+])
+
+val_aug = A.Compose([
+    A.Normalize(mean=[0.17361031, 0.17362685, 0.17362084], std=[0.06815493, 0.06816461, 0.06816177], p=1.0),
+    ToTensorV2(),
+])
+
+# 自定义模型
+class Net5(nn.Module):
+    def __init__(self, backbone_name, n_classes):
+        super(Net5, self).__init__()
+
+        self.n_classes = n_classes
+        self.backbone_name = backbone_name
+
+        # 使用EfficientNet-B7作为backbone
+        self.backbone = timm.create_model(self.backbone_name, pretrained=True, in_chans=3, global_pool="avg",
+                                          num_classes=2560)
+
+        self.dropout_1 = nn.Dropout(0.1)
+        self.dropout_2 = nn.Dropout(0.2)
+        self.dropout_3 = nn.Dropout(0.3)
+        self.dropout_4 = nn.Dropout(0.4)
+        self.dropout_5 = nn.Dropout(0.5)
+
+        self.head = nn.Linear(2560, self.n_classes)
+
+    def forward(self, x):
+        x = self.backbone(x)
+        x = (self.dropout_1(x) +
+             self.dropout_2(x) +
+             self.dropout_3(x) +
+             self.dropout_4(x) +
+             self.dropout_5(x)
+             ) / 5
+        y = self.head(x)
+
+        return y
+
+
+# 数据集定义保持不变
+class lwhdataset(Dataset):
+    def __init__(self, data_dir, train_transform, size, pad):
+        self.data_dir = data_dir
+        self.pad = pad
+        self.size = size
+        self.label_dict = {"0": 0, "1": 1, "2": 2, "3": 3}
+        self.c_paths = sorted(data_dir)
+        self.transforms = train_transform
+
+    def __getitem__(self, index):
+        label = self.label_dict[self.c_paths[index].split('\\')[-2]]
+        image = Image.open(self.c_paths[index]).convert("RGB")
+        if self.pad:
+            image = self.pading(self.size, image)
+            image = np.array(image)
+        else:
+            image = np.array(image)
+        image = self.transforms(image=image)['image']
+        return image, label
+
+    def __len__(self):
+        if len(self.c_paths) == 0:
+            raise Exception("\ndata_dir:{} is an empty dir! Please check your path to images!".format(self.data_dir))
+        return len(self.c_paths)
+
+    @staticmethod
+    def pading(size, img):
+        padding_v = tuple([125, 125, 125])
+
+        w, h = img.size
+
+        target_size = size
+
+        interpolation = Image.BILINEAR
+
+        if w > h:
+            img = img.resize((int(target_size), int(h * target_size * 1.0 / w)), interpolation)
+        else:
+            img = img.resize((int(w * target_size * 1.0 / h), int(target_size)), interpolation)
+
+        ret_img = Image.new("RGB", (target_size, target_size), padding_v)
+        w, h = img.size
+        st_w = int((ret_img.size[0] - w) / 2.0)
+        st_h = int((ret_img.size[1] - h) / 2.0)
+        ret_img.paste(img, (st_w, st_h))
+        return ret_img
+
+
+if __name__ == '__main__':
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+    class CFG:
+        seed = 42
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        ckpt_fold = "C:\CNN\model_efficientnet_b7_3"
+        ckpt_name = "tf_efficientnet_b7"
+        train_dir = r"C:\CNN\data_11\train"
+        val_dir = r"C:\CNN\data_11\val"
+        n_fold = 5
+        img_size = [224, 224]
+        train_bs = 4
+        valid_bs = train_bs
+        log_interval = 30
+        backbone = 'tf_efficientnet_b7'
+        num_classes = 4
+        epoch = 30
+        lr = 1e-3
+        wd = 5e-2
+        lr_drop = 8
+        thr = 0.5
+        early_stopping_patience = 10  # 早停法的耐心参数
+
+
+    set_seed(CFG.seed)
+
+    ckpt_path = os.path.join(CFG.ckpt_fold, CFG.ckpt_name)
+    if not os.path.exists(ckpt_path):
+        os.makedirs(ckpt_path)
+
+    train_path = sorted(glob.glob(CFG.train_dir + "/*/*"))
+    val_path = sorted(glob.glob(CFG.val_dir + "/*/*"))
+    random.seed(CFG.seed)
+
+    kf = KFold(n_splits=CFG.n_fold, shuffle=True, random_state=CFG.seed)
+
+    logger = get_logger(os.path.join(CFG.ckpt_fold, CFG.ckpt_name + '.log'))
+    logger.info('Using: {}'.format(CFG.ckpt_name))
+
+    model = Net5(backbone_name=CFG.backbone, n_classes=CFG.num_classes)
+
+    model.to(CFG.device)
+    swa_model = AveragedModel(model)
+
+    train_data = lwhdataset(data_dir=train_path, train_transform=train_aug, size=CFG.img_size[0], pad=True)
+    valid_data = lwhdataset(data_dir=val_path, train_transform=val_aug, size=CFG.img_size[0], pad=True)
+
+    train_loader = DataLoader(dataset=train_data, batch_size=CFG.train_bs, shuffle=True, num_workers=10, drop_last=True)
+    valid_loader = DataLoader(dataset=valid_data, batch_size=CFG.valid_bs, shuffle=False, num_workers=8)
+
+    x = [1.0, 1.0, 1.0, 1.0]
+    weight = torch.Tensor(x).to(CFG.device)
+    criterion = torch.nn.CrossEntropyLoss(weight=weight)
+
+    # 使用RAdam和Lookahead结合的优化器
+    base_optimizer = RAdam(model.parameters(), lr=CFG.lr, weight_decay=CFG.wd)
+    optimizer = Lookahead(base_optimizer)
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
+
+    scaler = amp.GradScaler(enabled=True)
+
+    best_val_acc = 0
+    step = 0
+    no_improvement_epochs = 0  # 用于记录没有改进的epoch次数
+
+    for epoch in range(1, CFG.epoch + 1):
+        model.train()
+        loss_mean = 0.
+        correct = 0.
+        total = 0.
+
+        # 跟踪训练的准确率
+        all_train_labels = []
+        all_train_preds = []
+
+        for i, (images, labels) in enumerate(train_loader):
+            images = images.to(CFG.device, dtype=torch.float)
+            labels = labels.to(CFG.device)
+
+            optimizer.zero_grad()
+
+            with amp.autocast(enabled=True):
+                y_preds = model(images)
+                loss = criterion(y_preds, labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            _, predicted = torch.max(y_preds.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+            all_train_labels.extend(labels.cpu().numpy())
+            all_train_preds.extend(predicted.cpu().numpy())
+
+            loss_mean += loss.item()
+            current_lr = optimizer.param_groups[0]['lr']
+
+            if (i + 1) % CFG.log_interval == 0:
+                loss_mean = loss_mean / CFG.log_interval
+                train_acc = correct / total
+                logger.info(
+                    "Training: Epoch[{:0>3}/{:0>3}] Iteration[{:0>3}/{:0>3}] Loss: {:.4f} Acc:{:.2%} current_lr:{:.5f}".format(
+                        epoch, CFG.epoch + 1, i + 1, len(train_loader), loss_mean, train_acc, current_lr))
+                step += 1
+                loss_mean = 0.
+
+        # 计算训练的F1分数
+        train_precision, train_recall, train_f1, _ = precision_recall_fscore_support(all_train_labels, all_train_preds,
+                                                                                     average=None)
+        class_f1 = {str(i): "{:.2%}".format(f1) for i, f1 in enumerate(train_f1)}
+        class_f1_avg = "{:.2%}".format(np.mean(train_f1))
+        logger.info("Training: Epoch[{:0>3}/{:0>3}] clssse_F1:{} class_F1_average:{}".format(
+            epoch, CFG.epoch + 1, class_f1, class_f1_avg))
+
+        # 验证
+        model.eval()
+        loss_val = 0.
+        correct_val = 0
+        total_val = 0
+        all_labels = []
+        all_preds = []
+
+        with torch.no_grad():
+            for j, (images, labels) in enumerate(valid_loader):
+                images = images.to(CFG.device, dtype=torch.float)
+                labels = labels.to(CFG.device)
+
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+                _, predicted = torch.max(outputs.data, 1)
+                total_val += labels.size(0)
+                correct_val += (predicted == labels).sum().item()
+
+                loss_val += loss.item()
+
+                all_labels.extend(labels.cpu().numpy())
+                all_preds.extend(predicted.cpu().numpy())
+
+            loss_val_mean = loss_val / len(valid_loader)
+            val_acc = correct_val / total_val
+            scheduler.step(loss_val_mean)
+
+            precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average=None)
+            class_f1 = {str(i): "{:.2%}".format(f1_score) for i, f1_score in enumerate(f1)}
+            class_f1_avg = "{:.2%}".format(np.mean(f1))
+
+            logger.info("Validation: Epoch[{:0>3}/{:0>3}] Iteration[{:0>3}/{:0>3}] Loss: {:.4f} Acc:{:.2%}".format(
+                epoch, CFG.epoch + 1, len(valid_loader), len(valid_loader), loss_val_mean, val_acc))
+            logger.info("Validation: clssse_F1:{} class_F1_average:{}".format(class_f1, class_f1_avg))
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                save_path = f"{ckpt_path}/best_model.pth"
+                torch.save(model.state_dict(), save_path)
+                no_improvement_epochs = 0  # 重置计数器
+            else:
+                no_improvement_epochs += 1
+
+            logger.info("Best validation accuracy: {:.2%}".format(best_val_acc))
+
+        # 早停法
+        if no_improvement_epochs >= CFG.early_stopping_patience:
+            logger.info("No improvement for {} epochs, stopping early.".format(CFG.early_stopping_patience))
+            break
+
+        gc.collect()
+
+    logger.info('Training completed.')
